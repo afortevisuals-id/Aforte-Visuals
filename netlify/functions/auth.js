@@ -1,77 +1,109 @@
 const crypto = require("crypto");
 
-function json(statusCode, body, extraHeaders = {}) {
+function json(statusCode, body) {
   return {
     statusCode,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store",
-      ...extraHeaders
+      "Cache-Control": "no-store"
     },
     body: JSON.stringify(body)
   };
 }
 
-function safeEqual(a, b) {
-  const left = Buffer.from(String(a || ""));
-  const right = Buffer.from(String(b || ""));
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
+function getCookie(event, name) {
+  const cookieHeader = event.headers.cookie || event.headers.Cookie || "";
+  const parts = cookieHeader.split(";").map(v => v.trim());
+  const item = parts.find(v => v.startsWith(name + "="));
+  return item ? decodeURIComponent(item.substring(name.length + 1)) : "";
 }
 
-function makeSession(email, secret) {
-  const payload = Buffer.from(JSON.stringify({
-    email,
-    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 12
-  })).toString("base64url");
+function validSession(event) {
+  const secret = process.env.SESSION_SECRET;
+  if (!secret || secret.length < 32) return false;
 
-  const signature = crypto
-    .createHmac("sha256", secret)
-    .update(payload)
-    .digest("base64url");
+  const token = getCookie(event, "aforte_session");
+  const pieces = token.split(".");
+  if (pieces.length !== 2) return false;
 
-  return `${payload}.${signature}`;
+  const [payload, signature] = pieces;
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest("base64url");
+
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+
+  try {
+    const data = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    return !!data.email &&
+      data.email === String(process.env.OWNER_EMAIL || "").trim().toLowerCase() &&
+      Number(data.exp) > Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
 }
 
 exports.handler = async function (event) {
-  const method = event.httpMethod;
-  if (method === "OPTIONS") {
+  if (event.httpMethod === "OPTIONS") {
     return { statusCode: 204, headers: { "Cache-Control": "no-store" }, body: "" };
   }
-  if (method !== "POST") return json(405, { ok: false, message: "Method tidak diizinkan" });
 
-  const ownerEmail = process.env.OWNER_EMAIL;
-  const ownerPassword = process.env.OWNER_PASSWORD;
-  const secret = process.env.SESSION_SECRET;
-
-  if (!ownerEmail || !ownerPassword || !secret || secret.length < 32) {
-    return json(500, { ok: false, message: "Pengaturan login belum lengkap di Netlify" });
+  // Semua permintaan API harus berasal dari sesi pemilik yang valid.
+  if (!validSession(event)) {
+    return json(401, { ok: false, message: "Silakan login terlebih dahulu" });
   }
 
-  let body;
+  if (!["GET", "POST"].includes(event.httpMethod)) {
+    return json(405, { ok: false, message: "Method tidak diizinkan" });
+  }
+
+  const gasUrl = process.env.GAS_WEB_APP_URL;
+  const token = process.env.GAS_API_TOKEN;
+  if (!gasUrl || !token) {
+    return json(500, { ok: false, message: "Konfigurasi backend belum lengkap" });
+  }
+
   try {
-    body = JSON.parse(event.body || "{}");
-  } catch {
-    return json(400, { ok: false, message: "Format permintaan tidak valid" });
+    let response;
+
+    if (event.httpMethod === "GET") {
+      const params = event.queryStringParameters || {};
+      const url = new URL(gasUrl);
+      url.searchParams.set("token", token);
+      url.searchParams.set("action", params.action || "ping");
+      if (params.sheet) url.searchParams.set("sheet", params.sheet);
+      response = await fetch(url.toString(), { method: "GET", redirect: "follow" });
+    } else {
+      let payload;
+      try {
+        payload = JSON.parse(event.body || "{}");
+      } catch {
+        return json(400, { ok: false, message: "Format JSON tidak valid" });
+      }
+
+      payload.token = token;
+      response = await fetch(gasUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        redirect: "follow"
+      });
+    }
+
+    const text = await response.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return json(502, {
+        ok: false,
+        message: "Respons Google Apps Script bukan JSON",
+        upstreamStatus: response.status
+      });
+    }
+
+    return json(response.ok ? 200 : response.status, data);
+  } catch (error) {
+    return json(502, { ok: false, message: "Gagal menghubungi Google Apps Script" });
   }
-
-  const action = String(body.action || "login").toLowerCase();
-
-  if (action === "logout") {
-    return json(200, { ok: true, message: "Berhasil keluar" }, {
-      "Set-Cookie": "aforte_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
-    });
-  }
-
-  const email = String(body.email || "").trim().toLowerCase();
-  const password = String(body.password || "");
-
-  if (!safeEqual(email, ownerEmail.trim().toLowerCase()) ||
-      !safeEqual(password, ownerPassword)) {
-    return json(401, { ok: false, message: "Email atau password salah" });
-  }
-
-  const session = makeSession(email, secret);
-  return json(200, { ok: true, message: "Login berhasil" }, {
-    "Set-Cookie": `aforte_session=${session}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=43200`
-  });
 };
